@@ -415,9 +415,24 @@ class KinematicsTensorConfig:
     #: Number of joints that are active. Each joint is only actuated along 1 dimension.
     n_dof: int
 
+    # Whether allow to set the root pose (3D translation and 4D quaternion)
+    use_root_pose: bool = False 
+
+    # The same joint in a group will be normalized during gradient-based optimization
+    grad_groups: List = None 
+    
+    # tendon_joints[0] = ['J1', 'J3'...]
+    # tendon_joints[1] = ['J2', 'J4'...]
+    # J1 = J2, J3 = J4 ...
+    tendon_joints: List[List] = None 
+    
     #: Name of links which have a mesh. Currently only used for debugging and rendering.
     mesh_link_names: Optional[List[str]] = None
 
+    contact_mesh_names: Optional[List[str]] = None
+
+    self_collision_link_mask: torch.Tensor = None
+    
     #: Name of all actuated joints.
     joint_names: Optional[List[str]] = None
 
@@ -682,6 +697,21 @@ class KinematicsTensorConfig:
         curr_spheres = self.get_reference_link_spheres(link_name)
         self.update_link_spheres(link_name, curr_spheres)
 
+    def get_replace_index(self, another_robot: KinematicsTensorConfig):
+        # another_robot should include all links of self
+        replace_lst = [-1] * len(list(filter(lambda a: a != -1, self.joint_map)))
+        for link, link_ind in self.link_name_to_idx_map.items():
+            if link in another_robot.link_name_to_idx_map:
+                new_link_ind = another_robot.link_name_to_idx_map[link]
+                new_ind = another_robot.joint_map[new_link_ind]
+                old_ind = self.joint_map[link_ind]
+                if new_ind == -1:
+                    continue 
+                replace_lst[old_ind] = new_ind
+            else:
+                log_error(f"link {link} not in another robot!")
+                raise NotImplementedError
+        return torch.stack(replace_lst).long()
 
 @dataclass
 class SelfCollisionKinematicsConfig:

@@ -39,7 +39,7 @@ from curobo.cuda_robot_model.types import (
     SelfCollisionKinematicsConfig,
 )
 from curobo.cuda_robot_model.util import load_robot_yaml
-from curobo.curobolib.kinematics import get_cuda_kinematics
+from curobo.geom.transform import get_cuda_kinematics
 from curobo.geom.sphere_fit import SphereFitType
 from curobo.geom.types import Mesh, Obstacle, Sphere
 from curobo.types.base import TensorDeviceType
@@ -86,6 +86,8 @@ class CudaRobotModelConfig:
     #: function does use Jacobian during backward pass. What's not supported is
     compute_jacobian: bool = False
 
+    hand_pose_transfer: Dict = None 
+
     #: Store transformation matrix of every link during forward kinematics call in global memory.
     #: This helps speed up backward pass as we don't need to recompute the transformation matrices.
     #: However, this increases memory usage and also slightly slows down forward kinematics.
@@ -103,6 +105,18 @@ class CudaRobotModelConfig:
         """
         return self.kinematics_config.joint_limits
 
+    @property
+    def use_root_pose(self):
+        return self.kinematics_config.use_root_pose
+    
+    @property
+    def grad_groups(self):
+        return self.kinematics_config.grad_groups
+    
+    @property
+    def tendon_joints(self):
+        return self.kinematics_config.tendon_joints
+    
     @staticmethod
     def from_basic_urdf(
         urdf_path: str,
@@ -254,6 +268,7 @@ class CudaRobotModelConfig:
             kinematics_parser=generator.kinematics_parser,
             use_global_cumul=generator.use_global_cumul,
             compute_jacobian=generator.compute_jacobian,
+            hand_pose_transfer=generator.hand_pose_transfer,
             generator_config=config,
         )
 
@@ -266,7 +281,19 @@ class CudaRobotModelConfig:
     def dof(self) -> int:
         """Get the number of actuated joints (degrees of freedom) of the robot"""
         return self.kinematics_config.n_dof
-
+    
+    def get_sphere_idx_from_namelst(self, name_lst: List[str], all_points_in_link: bool=False) -> torch.Tensor:
+        idx_lst = []
+        for name in name_lst:
+            link_name, idx_in_link = name.rsplit('/', 1)
+            link_idx_lst = self.kinematics_config.get_sphere_index_from_link_name(link_name)
+            if all_points_in_link:
+                idx_lst.extend(link_idx_lst)
+            else:
+                idx_lst.append(link_idx_lst[int(idx_in_link)])
+        idx_lst = torch.stack(idx_lst)
+        return idx_lst
+    
 
 @dataclass
 class CudaRobotModelState:
@@ -361,10 +388,12 @@ class CudaRobotModel(CudaRobotModelConfig):
         """
         if batch_size == 0:
             log_error("batch size is zero")
-        if force_update and self._batch_size == batch_size and self.compute_jacobian:
-            log_error("Outputting jacobian is not supported")
-            self.lin_jac = self.lin_jac.detach()  # .requires_grad_(True)
-            self.ang_jac = self.ang_jac.detach()  # .requires_grad_(True)
+        if force_update and self._batch_size == batch_size:
+            self._in_q = self._in_q.detach()
+            if self.compute_jacobian:
+                log_error("Outputting jacobian is not supported")
+                self.lin_jac = self.lin_jac.detach()  # .requires_grad_(True)
+                self.ang_jac = self.ang_jac.detach()  # .requires_grad_(True)
         elif self._batch_size != batch_size or reset_buffers:
             self._batch_size = batch_size
             self._link_pos_seq = torch.zeros(
@@ -382,6 +411,11 @@ class CudaRobotModel(CudaRobotModelConfig):
                 (self._batch_size, self.kinematics_config.total_spheres, 4),
                 device=self.tensor_args.device,
                 dtype=self.tensor_args.collision_geometry_dtype,
+            )
+            self._in_q = torch.zeros(
+                (self._batch_size, self.get_dof()),
+                device=self.tensor_args.device,
+                dtype=self.tensor_args.dtype,
             )
             self._grad_out_q = torch.zeros(
                 (self._batch_size, self.get_dof()),
@@ -431,8 +465,13 @@ class CudaRobotModel(CudaRobotModelConfig):
         batch_size = q.shape[0]
         self.update_batch_size(batch_size, force_update=q.requires_grad)
 
+        # average under-actuated joints 
+        self._in_q.copy_(q)
+        if self.tendon_joints is not None:
+            self._in_q[..., self.tendon_joints[0]] = self._in_q[..., self.tendon_joints[1]] = (q[..., self.tendon_joints[0]] + q[..., self.tendon_joints[1]]) / 2 
+
         # do fused forward:
-        link_pos_seq, link_quat_seq, link_spheres_tensor = self._cuda_forward(q)
+        link_pos_seq, link_quat_seq, link_spheres_tensor = self._cuda_forward(self._in_q)
 
         if len(self.link_names) == 1:
             ee_pos = link_pos_seq.squeeze(1)
@@ -484,6 +523,16 @@ class CudaRobotModel(CudaRobotModelConfig):
         )
         return state
 
+    def get_contact_link_meshes(self):
+        if self.kinematics_config.contact_mesh_names is None:
+            return None, None
+        m_list = []
+        for l in self.kinematics_config.contact_mesh_names:
+            m_list.extend(self.get_link_mesh(l))
+        idx_list = [self.link_names.index(l) for l in self.kinematics_config.contact_mesh_names]
+        assert len(idx_list) == len(m_list)
+        return m_list, idx_list
+    
     def compute_kinematics(
         self, js: JointState, link_name: Optional[str] = None, calculate_jacobian: bool = False
     ) -> CudaRobotModelState:
@@ -554,7 +603,9 @@ class CudaRobotModel(CudaRobotModelConfig):
         Returns:
             List[Mesh]: List of all link meshes.
         """
-        m_list = [self.get_link_mesh(l) for l in self.kinematics_config.mesh_link_names]
+        m_list = []
+        for l in self.kinematics_config.mesh_link_names:
+            m_list.extend(self.get_link_mesh(l))
 
         return m_list
 
@@ -664,6 +715,7 @@ class CudaRobotModel(CudaRobotModelConfig):
             self._batch_robot_spheres,
             self._global_cumul_mat,
             q,
+            self.kinematics_config.use_root_pose,
             self.kinematics_config.fixed_transforms,
             self.kinematics_config.link_spheres,
             self.kinematics_config.link_map,  # tells which link is attached to which link i
@@ -687,7 +739,7 @@ class CudaRobotModel(CudaRobotModelConfig):
         """Get self collision configuration parameters of the robot."""
         return self.self_collision_config
 
-    def get_link_mesh(self, link_name: str) -> Mesh:
+    def get_link_mesh(self, link_name: str) -> List[Mesh]:
         """Get mesh of a link of the robot."""
         mesh = self.kinematics_parser.get_link_mesh(link_name)
         return mesh
@@ -786,6 +838,26 @@ class CudaRobotModel(CudaRobotModelConfig):
         new_js = js.get_augmented_joint_state(js.joint_names + extra_js.joint_names, extra_js)
         return new_js
 
+    def get_transfered_pose(self, t, r, link_names):
+        if not isinstance(link_names, List):
+            link_names = [link_names]
+        transfer_rot = []
+        transfer_trans = []
+        for link in link_names:
+            transfer_rot.append(self.hand_pose_transfer['r'][link])
+            transfer_trans.append(self.hand_pose_transfer['t'][link])
+        transfer_rot = torch.stack(transfer_rot, dim=1)
+        transfer_trans = torch.stack(transfer_trans, dim=1)
+        
+        link_num = len(link_names)
+        new_r = (r.view(-1, link_num, 3, 3) @ transfer_rot).view(r.shape)
+        new_t = (t.view(-1, link_num, 3, 1) + (r.view(-1, link_num, 3, 3) @ transfer_trans)).view(t.shape)
+        return new_t, new_r
+    
+    @property
+    def transfered_link_name(self, ):
+        return list(self.hand_pose_transfer['r'].keys())
+    
     def update_kinematics_config(self, new_kin_config: KinematicsTensorConfig):
         """Update kinematics representation of the robot.
 
