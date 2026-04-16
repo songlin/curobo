@@ -18,22 +18,39 @@
 # * https://setuptools.pypa.io/en/latest/setuptools.html#setup-cfg-only-projects
 
 # Standard Library
+import os
 import sys
 
 # Third Party
 import setuptools
 from torch.utils.cpp_extension import BuildExtension, CUDAExtension
 
-extra_cuda_args = {
-    "nvcc": [
-        "--threads=8",
-        "-O3",
-        "--ftz=true",
-        "--fmad=true",
-        "--prec-div=false",
-        "--prec-sqrt=false",
-    ]
-}
+def build_extra_compile_args():
+    args = {
+        "cxx": [],
+        "nvcc": [
+            "--threads=8",
+            "-O3",
+            "--ftz=true",
+            "--fmad=true",
+            "--prec-div=false",
+            "--prec-sqrt=false",
+        ],
+    }
+
+    libc_dev = os.environ.get("SIMPLE_LIBC_DEV")
+    libc_include = os.path.join(libc_dev, "include") if libc_dev else ""
+    if libc_include and os.path.isdir(libc_include):
+        # torch.cpp_extension builds its own compile command lines and may miss
+        # the wrapped compiler's libc include path on Nix-style toolchains.
+        # Add libc headers after libstdc++ headers so #include_next still works.
+        args["cxx"] += ["-idirafter", libc_include]
+        args["nvcc"] += ["--compiler-options", f"'-idirafter,{libc_include}'"]
+
+    return args
+
+
+extra_cuda_args = build_extra_compile_args()
 
 if sys.platform == "win32":
     extra_cuda_args["nvcc"].append("--allow-unsupported-compiler")
