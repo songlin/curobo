@@ -46,15 +46,6 @@ from curobo.types.state import JointState
 from curobo.util.logger import log_error, log_info, log_warn
 from curobo.util_file import get_assets_path, get_robot_configs_path, join_path, load_yaml
 
-try:
-    # CuRobo
-    from curobo.cuda_robot_model.usd_kinematics_parser import UsdKinematicsParser
-except ImportError:
-    log_info(
-        "USDParser failed to import, install curobo with pip install .[usd] "
-        + "or pip install usd-core, NOTE: Do not install this if using with Isaac Sim."
-    )
-
 
 @dataclass
 class CudaRobotGeneratorConfig:
@@ -352,6 +343,10 @@ class CudaRobotGenerator(CudaRobotGeneratorConfig):
         # load kinematics parser based on file type:
         # NOTE: Also add option to load from data buffers.
         if self.use_usd_kinematics:
+            # Imported lazily: pxr must not be loaded before Isaac Sim's SimulationApp starts,
+            # otherwise a pip-installed USD (e.g. usd-exchange's) shadows Kit's and Kit fails to load.
+            from curobo.cuda_robot_model.usd_kinematics_parser import UsdKinematicsParser
+
             self._kinematics_parser = UsdKinematicsParser(
                 self.usd_path,
                 flip_joints=self.usd_flip_joints,
